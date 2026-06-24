@@ -4,20 +4,24 @@ import numpy as np
 import ot
 from scipy.spatial import distance_matrix
 
-from src.interpolation import interpolate, preprocess
-from src.alignment import align
-
 
 def compute_wasserstein_distance(outline_1, outline_2):
+    """
+    Natalia-style W2 distance:
+        W2 = sqrt(emd2(a, b, ||x-y||^2))
+    """
     n1 = outline_1.shape[0]
     n2 = outline_2.shape[0]
 
     weights_1 = np.ones(n1) / n1
     weights_2 = np.ones(n2) / n2
 
-    cost_matrix = distance_matrix(outline_1, outline_2, p=2)
+    D12 = distance_matrix(outline_1, outline_2, p=2)
+    cost_matrix = np.square(D12)
 
-    return ot.emd2(weights_1, weights_2, cost_matrix)
+    return np.sqrt(
+        ot.emd2(weights_1, weights_2, cost_matrix)
+    )
 
 
 def get_cell_dirs(cells_dir):
@@ -54,71 +58,76 @@ def load_centroid(frame_dir):
     return np.load(frame_dir / "centroid.npy")
 
 
-def preprocess_outline(outline, n_points=200):
-    outline = interpolate(outline, n_points)
-    outline = preprocess(outline)
-
-    return outline
+def center_outline(outline, centroid):
+    return np.asarray(outline, dtype=float) - np.asarray(centroid, dtype=float)
 
 
-def compute_cell_distances(cell_dir, n_points=200):
+def load_cell_data_sorted_by_time(cell_dir):
     frame_dirs = get_frame_dirs(cell_dir)
 
     if len(frame_dirs) == 0:
         raise ValueError(f"No frame directories found in {cell_dir}")
 
-    n_frames = len(frame_dirs)
+    records = []
 
-    distances = np.zeros(n_frames)
-    times = np.zeros(n_frames)
-    centroids = np.zeros((n_frames, 2))
+    for frame_dir in frame_dirs:
+        time = load_time(frame_dir)
+        centroid = load_centroid(frame_dir)
+        outline = load_outline(frame_dir)
 
-    reference_outline = preprocess_outline(
-        load_outline(frame_dirs[0]),
-        n_points=n_points
-    )
+        centered_outline = center_outline(outline, centroid)
 
-    reference_outline = align(
-        reference_outline,
-        reference_outline,
-        rescale=True,
-        rotation=False,
-        reparameterization=True,
-        k_sampling_points=n_points
-    )
-
-    for frame_idx, frame_dir in enumerate(frame_dirs):
-        outline = preprocess_outline(
-            load_outline(frame_dir),
-            n_points=n_points
+        records.append(
+            {
+                "time": time,
+                "centroid": centroid,
+                "outline": centered_outline,
+            }
         )
 
-        aligned_outline = align(
-            outline,
-            reference_outline,
-            rescale=False,
-            rotation=False,
-            reparameterization=False,
-            k_sampling_points=n_points
-        )
+    records = sorted(records, key=lambda x: x["time"])
 
+    times = np.asarray([r["time"] for r in records], dtype=int)
+    centroids = np.asarray([r["centroid"] for r in records], dtype=float)
+    outlines = [r["outline"] for r in records]
+
+    return outlines, times, centroids
+
+
+def compute_cell_distances(cell_dir):
+    outlines, times, centroids = load_cell_data_sorted_by_time(cell_dir)
+
+    n_frames = len(outlines)
+
+    distances = np.zeros(n_frames, dtype=float)
+
+    for frame_idx in range(1, n_frames):
         distances[frame_idx] = compute_wasserstein_distance(
-            aligned_outline,
-            reference_outline
+            outlines[frame_idx - 1],
+            outlines[frame_idx]
         )
 
-        times[frame_idx] = load_time(frame_dir)
-        centroids[frame_idx] = load_centroid(frame_dir)
+    first_outline = outlines[0]
+    last_outline = outlines[-1]
 
-        reference_outline = aligned_outline
+    first_last_distance = compute_wasserstein_distance(
+        first_outline,
+        last_outline
+    )
 
-    return distances, times, centroids
+    return (
+        distances,
+        times,
+        centroids,
+        first_outline,
+        last_outline,
+        first_last_distance
+    )
 
 
 def compute_dataset_distances(
     cells_dir,
     output_dir,
-    n_points=200,
     verbose=False
 ):
     cells_dir = Path(cells_dir)
@@ -134,18 +143,30 @@ def compute_dataset_distances(
     all_times = []
     all_centroids = []
 
+    first_shapes = []
+    last_shapes = []
+    first_last_shape_distances = []
+
     for cell_idx, cell_dir in enumerate(cell_dirs, start=1):
         if verbose:
             print(f"Processing {cell_dir.name} ({cell_idx}/{len(cell_dirs)})")
 
-        distances, times, centroids = compute_cell_distances(
-            cell_dir=cell_dir,
-            n_points=n_points
-        )
+        (
+            distances,
+            times,
+            centroids,
+            first_outline,
+            last_outline,
+            first_last_distance
+        ) = compute_cell_distances(cell_dir=cell_dir)
 
         all_distances.append(distances)
         all_times.append(times)
         all_centroids.append(centroids)
+
+        first_shapes.append(first_outline)
+        last_shapes.append(last_outline)
+        first_last_shape_distances.append(first_last_distance)
 
     np.save(
         output_dir / "ot_distances.npy",
@@ -165,13 +186,37 @@ def compute_dataset_distances(
         allow_pickle=True
     )
 
-    return all_distances, all_times, all_centroids
+    np.save(
+        output_dir / "first_shapes.npy",
+        np.array(first_shapes, dtype=object),
+        allow_pickle=True
+    )
+
+    np.save(
+        output_dir / "last_shapes.npy",
+        np.array(last_shapes, dtype=object),
+        allow_pickle=True
+    )
+
+    np.save(
+        output_dir / "first_last_shape_distances.npy",
+        np.array(first_last_shape_distances),
+        allow_pickle=True
+    )
+
+    return (
+        all_distances,
+        all_times,
+        all_centroids,
+        first_shapes,
+        last_shapes,
+        first_last_shape_distances
+    )
 
 
 if __name__ == "__main__":
     compute_dataset_distances(
-        cells_dir=".",
-        output_dir=".",
-        n_points=200,
+        cells_dir="../data/cells_filtered",
+        output_dir="",
         verbose=True
     )
